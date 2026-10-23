@@ -48,9 +48,9 @@ def get_groq_api_key() -> str | None:
     return key if key else None
 
 
-def get_ollama_base_url() -> str:
-    """Retrieve Ollama host URL (default: http://localhost:11434)."""
-    return os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip().rstrip("/")
+def get_default_provider() -> str:
+    """Determine the default provider: Groq if GROQ_API_KEY is configured, else Gemini."""
+    return "groq" if get_groq_api_key() else "gemini"
 
 
 def mask_key(key: str | None) -> str:

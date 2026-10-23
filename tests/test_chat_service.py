@@ -415,41 +415,63 @@ class TestConversationalChatService:
         assert "TOKEN_SECRET_ABC_123" not in combined_payload
         assert "Delhi" in combined_payload
 
-    @patch("src.services.chat_service.requests.get")
+    @patch("src.services.chat_service.genai.Client")
     @patch("src.services.chat_service.requests.post")
-    def test_ollama_stream_and_non_streaming(self, mock_post, mock_get):
-        """Verify that Ollama executes with 0 API keys in both streaming and non-streaming modes."""
-        # Mock is_ollama_running
-        mock_get_resp = MagicMock()
-        mock_get_resp.status_code = 200
-        mock_get.return_value = mock_get_resp
+    def test_groq_failover_to_gemini(self, mock_post, mock_client_cls):
+        """Verify that when Groq encounters a quota error (429), it safely fails over to Gemini."""
+        mock_groq_resp = MagicMock()
+        mock_groq_resp.status_code = 429
+        mock_post.return_value = mock_groq_resp
 
-        # Mock streaming response
-        mock_post_stream = MagicMock()
-        mock_post_stream.status_code = 200
-        mock_post_stream.iter_lines.return_value = [
-            '{"message": {"content": "Hello "}, "done": false}',
-            '{"message": {"content": "from Ollama!"}, "done": true}',
-        ]
-        mock_post.return_value = mock_post_stream
+        mock_client = MagicMock()
+        mock_gemini_resp = MagicMock()
+        mock_gemini_resp.text = "Answer from Gemini failover!"
+        mock_client.models.generate_content.return_value = mock_gemini_resp
+        mock_client_cls.return_value = mock_client
 
-        service = ConversationalChatService(provider="ollama", model_name="gemma:2b")
-        result = StreamResult()
-        chunks = list(service.stream_message("Hi", result_holder=result))
+        service = ConversationalChatService(
+            groq_api_key="gsk-test",
+            gemini_api_key="gem-test",
+            provider="groq",
+        )
+        response = service.send_message("Hello AI")
+        assert response.content == "Answer from Gemini failover!"
+        assert response.provider_used == "gemini"
 
-        assert chunks == ["Hello ", "from Ollama!"]
-        assert result.full_content == "Hello from Ollama!"
-        assert result.provider_used == "ollama"
+    @patch("src.services.chat_service.genai.Client")
+    @patch("src.services.chat_service.requests.post")
+    def test_gemini_failover_to_groq(self, mock_post, mock_client_cls):
+        """Verify that when Gemini encounters quota exhaustion, it safely fails over to Groq."""
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = ClientError(429, {"error": {"message": "RESOURCE_EXHAUSTED"}})
+        mock_client_cls.return_value = mock_client
 
-        # Mock non-streaming response
-        mock_post_direct = MagicMock()
-        mock_post_direct.status_code = 200
-        mock_post_direct.json.return_value = {"message": {"content": "Direct response."}}
-        mock_post.return_value = mock_post_direct
+        mock_groq_resp = MagicMock()
+        mock_groq_resp.status_code = 200
+        mock_groq_resp.json.return_value = {"choices": [{"message": {"content": "Answer from Groq failover!"}}]}
+        mock_post.return_value = mock_groq_resp
 
-        resp = service.send_message("Hello")
-        assert resp.content == "Direct response."
-        assert resp.provider_used == "ollama"
+        service = ConversationalChatService(
+            gemini_api_key="gem-test",
+            groq_api_key="gsk-test",
+            provider="gemini",
+        )
+        response = service.send_message("Explain quantum computing")
+        assert response.content == "Answer from Groq failover!"
+        assert response.provider_used == "groq"
+
+    def test_missing_all_providers_raises_clear_error(self):
+        """Verify that when no provider is configured, a clear error is raised without mentioning Ollama."""
+        service = ConversationalChatService(
+            gemini_api_keys=[],
+            gemini_api_key="",
+            groq_api_key="",
+            provider="gemini",
+        )
+        with pytest.raises(MissingChatKeyError) as exc_info:
+            service.send_message("Hello")
+        assert ("Gemini API key is missing" in str(exc_info.value) or "No AI provider" in str(exc_info.value))
+        assert "ollama" not in str(exc_info.value).lower()
 
     @patch("src.services.chat_service.requests.post")
     def test_groq_streaming(self, mock_post):

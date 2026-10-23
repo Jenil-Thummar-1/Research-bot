@@ -1,11 +1,11 @@
 """Conversational AI chat service for general-purpose multi-turn interactions.
 
 Provides ChatGPT-like conversation capabilities, supporting English, Hindi,
-and Hinglish, contextual follow-ups, and multiple backend providers:
-1. Google Gemini (with multi-key pool rotation for free tier quota exhaustion)
-2. Ollama (100% free, local offline, zero API keys required)
-3. Groq Cloud (14,400 free requests/day with Llama 3.3 70B)
-4. Web search grounding via DuckDuckGo (100% keyless) or Tavily.
+and Hinglish, contextual follow-ups, and supported cloud backend providers:
+1. Groq Cloud (Recommended default when configured; 14,400 free requests/day with Llama 3.3 70B)
+2. Google Gemini (with multi-key pool rotation for free tier quota exhaustion)
+Automatic safe failover between supported cloud providers.
+Web search grounding via DuckDuckGo (100% keyless) or Tavily.
 """
 
 from dataclasses import dataclass, field
@@ -21,10 +21,10 @@ from google.genai import types
 from google.genai.errors import APIError, ClientError, ServerError
 
 from src.config import (
+    get_default_provider,
     get_gemini_api_key,
     get_gemini_api_keys,
     get_groq_api_key,
-    get_ollama_base_url,
 )
 from src.services.chat_history_service import ChatMessage
 from src.services.report_service import (
@@ -37,7 +37,6 @@ from src.services.search_service import TavilySearchService, SearchServiceError
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_OLLAMA_MODEL = "gemma:2b"
 DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 
 DEFAULT_SYSTEM_INSTRUCTION = """You are a helpful, versatile, and articulate AI conversational assistant.
@@ -130,30 +129,6 @@ def should_auto_search(prompt: str) -> bool:
     return any(re.search(pattern, lower_prompt) for pattern in SEARCH_AUTO_KEYWORDS)
 
 
-def is_ollama_running(base_url: str | None = None) -> bool:
-    """Check if the local Ollama daemon is currently running and responding."""
-    url = (base_url or get_ollama_base_url()).rstrip("/")
-    try:
-        resp = requests.get(f"{url}/api/tags", timeout=1.5)
-        return resp.status_code == 200
-    except Exception:
-        return False
-
-
-def get_available_ollama_models(base_url: str | None = None) -> list[str]:
-    """Retrieve list of locally installed Ollama models."""
-    url = (base_url or get_ollama_base_url()).rstrip("/")
-    try:
-        resp = requests.get(f"{url}/api/tags", timeout=2.5)
-        if resp.status_code == 200:
-            data = resp.json()
-            models = [m.get("name", "") for m in data.get("models", []) if m.get("name")]
-            return models
-    except Exception:
-        pass
-    return []
-
-
 def format_conversation_for_gemini(
     history: Sequence[ChatMessage],
     current_prompt: str,
@@ -215,7 +190,7 @@ def format_conversation_for_openai(
     max_turns: int = 12,
     evidence_text: str | None = None,
 ) -> list[dict[str, str]]:
-    """Format past chat history and prompt for OpenAI-compatible endpoints (Ollama, Groq)."""
+    """Format past chat history and prompt for OpenAI-compatible endpoints (e.g., Groq)."""
     messages = [{"role": "system", "content": system_instruction}]
     selected_history = list(history)[-max_turns:] if max_turns > 0 else []
 
@@ -239,10 +214,9 @@ class ConversationalChatService:
         gemini_api_keys: list[str] | None = None,
         tavily_api_key: str | None = None,
         groq_api_key: str | None = None,
-        ollama_base_url: str | None = None,
-        provider: Literal["gemini", "ollama", "groq"] = "gemini",
+        provider: Literal["gemini", "groq"] | str | None = None,
         search_provider: Literal["auto", "tavily", "duckduckgo"] = "auto",
-        model_name: str = DEFAULT_GEMINI_MODEL,
+        model_name: str | None = None,
         system_instruction: str = DEFAULT_SYSTEM_INSTRUCTION,
         search_service: TavilySearchService | None = None,
     ):
@@ -257,24 +231,38 @@ class ConversationalChatService:
         self._gemini_api_key = self._gemini_api_keys[0] if self._gemini_api_keys else ""
         self._current_key_idx = 0
 
-        self._groq_api_key = (groq_api_key if groq_api_key is not None else get_groq_api_key() or "").strip()
-        self._ollama_base_url = (ollama_base_url if ollama_base_url is not None else get_ollama_base_url()).strip()
+        if groq_api_key is not None:
+            self._groq_api_key = groq_api_key.strip()
+        elif (gemini_api_key is not None) or (gemini_api_keys is not None):
+            self._groq_api_key = (get_groq_api_key() or "").strip() if provider == "groq" else ""
+        else:
+            self._groq_api_key = (get_groq_api_key() or "").strip()
 
-        self._provider = provider
+        # Resolve provider: explicit provider > explicit groq_api_key > explicit gemini_api_key > default from env
+        if provider:
+            self._provider = str(provider).lower()
+        elif groq_api_key is not None and groq_api_key.strip():
+            self._provider = "groq"
+        elif (gemini_api_key is not None) or (gemini_api_keys is not None):
+            self._provider = "gemini"
+        else:
+            self._provider = get_default_provider()
+
+        if model_name:
+            self._model_name = model_name
+        else:
+            self._model_name = DEFAULT_GROQ_MODEL if self._provider == "groq" else DEFAULT_GEMINI_MODEL
+
         self._search_provider = search_provider
-        self._model_name = model_name
         self._system_instruction = system_instruction
         self._search_service = search_service or TavilySearchService(api_key=tavily_api_key)
 
     @property
     def is_configured(self) -> bool:
-        """Check whether the active provider is configured and available."""
-        if self._provider == "ollama":
-            return is_ollama_running(self._ollama_base_url)
-        elif self._provider == "groq":
+        """Check whether the active provider (or any supported provider) is configured."""
+        if self._provider == "groq":
             return bool(self._groq_api_key)
-        else:
-            return bool(self._gemini_api_key or self._gemini_api_keys)
+        return bool(self._gemini_api_key or self._gemini_api_keys)
 
     @property
     def model_name(self) -> str:
@@ -397,51 +385,128 @@ class ConversationalChatService:
 
         web_search_active = bool(sources)
 
-        # Provider 1: Ollama (100% Free / Local Offline)
-        if active_provider == "ollama":
-            if not is_ollama_running(self._ollama_base_url):
-                raise ChatServiceError(
-                    f"Local Ollama is not running on {self._ollama_base_url}. "
-                    "Start Ollama with `ollama serve` or open the Ollama app."
-                )
-            target_model = active_model if active_model not in (DEFAULT_GEMINI_MODEL, "gemini-3.5-flash") else DEFAULT_OLLAMA_MODEL
-            messages = format_conversation_for_openai(
-                system_instruction=self._system_instruction,
-                history=history,
-                current_prompt=clean_prompt,
-                max_turns=max_context_turns,
-                evidence_text=evidence_text if web_search_active else None,
-            )
-            raw_text = self._call_ollama(target_model, messages, timeout_seconds)
-            effective_model = target_model
+        has_groq = bool(self._groq_api_key)
+        has_gemini = bool(self._gemini_api_key or self._gemini_api_keys)
 
-        # Provider 2: Groq Cloud (Free Tier 14,400 req/day)
-        elif active_provider == "groq":
-            if not self._groq_api_key:
+        if not has_groq and not has_gemini:
+            if active_provider == "gemini":
+                raise MissingChatKeyError(
+                    "Gemini API key is missing. Add GEMINI_API_KEY to your .env file or get a key at https://aistudio.google.com."
+                )
+            if active_provider == "groq":
                 raise MissingChatKeyError(
                     "Groq API key is missing. Add GROQ_API_KEY to your .env file or get a free key at https://console.groq.com."
                 )
-            target_model = active_model if active_model not in (DEFAULT_GEMINI_MODEL, "gemini-3.5-flash") else DEFAULT_GROQ_MODEL
-            messages = format_conversation_for_openai(
-                system_instruction=self._system_instruction,
-                history=history,
-                current_prompt=clean_prompt,
-                max_turns=max_context_turns,
-                evidence_text=evidence_text if web_search_active else None,
+            raise MissingChatKeyError(
+                "No AI provider is configured. Please provide a GROQ_API_KEY (free at https://console.groq.com) "
+                "or GEMINI_API_KEY (free at https://aistudio.google.com) in your .env file or sidebar."
             )
-            raw_text = self._call_groq(target_model, messages, timeout_seconds)
-            effective_model = target_model
 
-        # Provider 3: Google Gemini (with Key Pool Rotation)
+        raw_text = ""
+        effective_model = active_model
+        effective_provider = active_provider
+
+        # Attempt with active provider, with automatic failover between Groq and Gemini
+        if active_provider == "groq":
+            if not has_groq:
+                if has_gemini:
+                    logger.info("Groq key missing; failing over to Gemini")
+                    raw_text, effective_model = self._call_gemini_with_rotation(
+                        history=history,
+                        clean_prompt=clean_prompt,
+                        evidence_text=evidence_text if web_search_active else None,
+                        max_context_turns=max_context_turns,
+                        timeout_seconds=timeout_seconds,
+                        preferred_model=DEFAULT_GEMINI_MODEL,
+                    )
+                    effective_provider = "gemini"
+                else:
+                    raise MissingChatKeyError(
+                        "Groq API key is missing. Add GROQ_API_KEY to your .env file or get a free key at https://console.groq.com."
+                    )
+            else:
+                target_model = active_model if active_model not in (DEFAULT_GEMINI_MODEL, "gemini-3.5-flash") else DEFAULT_GROQ_MODEL
+                messages = format_conversation_for_openai(
+                    system_instruction=self._system_instruction,
+                    history=history,
+                    current_prompt=clean_prompt,
+                    max_turns=max_context_turns,
+                    evidence_text=evidence_text if web_search_active else None,
+                )
+                try:
+                    raw_text = self._call_groq(target_model, messages, timeout_seconds)
+                    effective_model = target_model
+                    effective_provider = "groq"
+                except (ChatQuotaError, ChatTimeoutError, ChatServiceError) as err:
+                    if has_gemini and not isinstance(err, ChatAuthError):
+                        logger.warning("Groq call failed (%s); failing over to Gemini", err)
+                        try:
+                            raw_text, effective_model = self._call_gemini_with_rotation(
+                                history=history,
+                                clean_prompt=clean_prompt,
+                                evidence_text=evidence_text if web_search_active else None,
+                                max_context_turns=max_context_turns,
+                                timeout_seconds=timeout_seconds,
+                                preferred_model=DEFAULT_GEMINI_MODEL,
+                            )
+                            effective_provider = "gemini"
+                        except Exception as gemini_err:
+                            logger.warning("Gemini failover also failed: %s; re-raising primary Groq error", gemini_err)
+                            raise err
+                    else:
+                        raise
+
         else:
-            raw_text, effective_model = self._call_gemini_with_rotation(
-                history=history,
-                clean_prompt=clean_prompt,
-                evidence_text=evidence_text if web_search_active else None,
-                max_context_turns=max_context_turns,
-                timeout_seconds=timeout_seconds,
-                preferred_model=active_model,
-            )
+            # Active provider: Gemini
+            if not has_gemini:
+                if has_groq:
+                    logger.info("Gemini key missing; failing over to Groq")
+                    target_model = DEFAULT_GROQ_MODEL
+                    messages = format_conversation_for_openai(
+                        system_instruction=self._system_instruction,
+                        history=history,
+                        current_prompt=clean_prompt,
+                        max_turns=max_context_turns,
+                        evidence_text=evidence_text if web_search_active else None,
+                    )
+                    raw_text = self._call_groq(target_model, messages, timeout_seconds)
+                    effective_model = target_model
+                    effective_provider = "groq"
+                else:
+                    raise MissingChatKeyError(
+                        "Gemini API key is missing. Add GEMINI_API_KEY to your .env file or get a key at https://aistudio.google.com."
+                    )
+            else:
+                try:
+                    raw_text, effective_model = self._call_gemini_with_rotation(
+                        history=history,
+                        clean_prompt=clean_prompt,
+                        evidence_text=evidence_text if web_search_active else None,
+                        max_context_turns=max_context_turns,
+                        timeout_seconds=timeout_seconds,
+                        preferred_model=active_model,
+                    )
+                    effective_provider = "gemini"
+                except (ChatQuotaError, ChatTimeoutError, ChatServiceError) as err:
+                    if has_groq and not isinstance(err, ChatAuthError):
+                        logger.warning("Gemini call failed (%s); failing over to Groq", err)
+                        try:
+                            target_model = DEFAULT_GROQ_MODEL
+                            messages = format_conversation_for_openai(
+                                system_instruction=self._system_instruction,
+                                history=history,
+                                current_prompt=clean_prompt,
+                                max_turns=max_context_turns,
+                                evidence_text=evidence_text if web_search_active else None,
+                            )
+                            raw_text = self._call_groq(target_model, messages, timeout_seconds)
+                            effective_model = target_model
+                            effective_provider = "groq"
+                        except Exception as groq_err:
+                            logger.warning("Groq failover also failed: %s; re-raising primary Gemini error", groq_err)
+                            raise err
+                    else:
+                        raise
 
         # Bind citation links if search evidence was used
         final_text = raw_text
@@ -456,7 +521,7 @@ class ConversationalChatService:
             web_search_used=web_search_active,
             search_query=effective_search_query if web_search_active else "",
             model_used=effective_model,
-            provider_used=active_provider,
+            provider_used=effective_provider,
             elapsed_seconds=round(elapsed, 2),
         )
 
@@ -473,7 +538,7 @@ class ConversationalChatService:
         provider: str | None = None,
         model_name: str | None = None,
     ) -> Generator[str, None, None]:
-        """Stream a conversational response incrementally."""
+        """Stream a conversational response incrementally with automatic failover support."""
         clean_prompt = (user_prompt or "").strip()
         if not clean_prompt:
             raise ChatServiceError("User message cannot be empty.")
@@ -498,6 +563,23 @@ class ConversationalChatService:
 
         web_search_active = bool(sources)
 
+        has_groq = bool(self._groq_api_key)
+        has_gemini = bool(self._gemini_api_key or self._gemini_api_keys)
+
+        if not has_groq and not has_gemini:
+            if active_provider == "gemini":
+                raise MissingChatKeyError(
+                    "Gemini API key is missing. Add GEMINI_API_KEY to your .env file or get a key at https://aistudio.google.com."
+                )
+            if active_provider == "groq":
+                raise MissingChatKeyError(
+                    "Groq API key is missing. Add GROQ_API_KEY to your .env file or get a free key at https://console.groq.com."
+                )
+            raise MissingChatKeyError(
+                "No AI provider is configured. Please provide a GROQ_API_KEY (free at https://console.groq.com) "
+                "or GEMINI_API_KEY (free at https://aistudio.google.com) in your .env file or sidebar."
+            )
+
         if result_holder is not None:
             result_holder.sources = sources
             result_holder.web_search_used = web_search_active
@@ -507,90 +589,137 @@ class ConversationalChatService:
         accumulated_chunks: list[str] = []
         first_token_time: float | None = None
         effective_model = active_model
+        effective_provider = active_provider
 
         try:
-            if active_provider == "ollama":
-                if not is_ollama_running(self._ollama_base_url):
-                    raise ChatServiceError(
-                        f"Local Ollama is not running on {self._ollama_base_url}. "
-                        "Start Ollama with `ollama serve` or open the Ollama app."
-                    )
-                target_model = active_model if active_model not in (DEFAULT_GEMINI_MODEL, "gemini-3.5-flash") else DEFAULT_OLLAMA_MODEL
-                effective_model = target_model
-                messages = format_conversation_for_openai(
-                    system_instruction=self._system_instruction,
-                    history=history,
-                    current_prompt=clean_prompt,
-                    max_turns=max_context_turns,
-                    evidence_text=evidence_text if web_search_active else None,
-                )
-                stream_iter = self._stream_ollama(target_model, messages, timeout_seconds, should_stop_callback)
-                for chunk in stream_iter:
-                    if should_stop_callback is not None and should_stop_callback():
-                        if result_holder is not None:
-                            result_holder.stopped_early = True
-                        break
-                    if chunk:
-                        if first_token_time is None:
-                            first_token_time = time.perf_counter() - start_time
-                            if result_holder is not None:
-                                result_holder.time_to_first_token = round(first_token_time, 2)
-                        accumulated_chunks.append(chunk)
-                        yield chunk
-
-            elif active_provider == "groq":
-                if not self._groq_api_key:
+            if active_provider == "groq":
+                if not has_groq and has_gemini:
+                    logger.info("Groq key missing; failing over to Gemini streaming")
+                    active_provider = "gemini"
+                    effective_provider = "gemini"
+                elif not has_groq:
                     raise MissingChatKeyError(
                         "Groq API key is missing. Add GROQ_API_KEY to your .env file or get a free key at https://console.groq.com."
                     )
-                target_model = active_model if active_model not in (DEFAULT_GEMINI_MODEL, "gemini-3.5-flash") else DEFAULT_GROQ_MODEL
-                effective_model = target_model
-                messages = format_conversation_for_openai(
-                    system_instruction=self._system_instruction,
-                    history=history,
-                    current_prompt=clean_prompt,
-                    max_turns=max_context_turns,
-                    evidence_text=evidence_text if web_search_active else None,
-                )
-                stream_iter = self._stream_groq(target_model, messages, timeout_seconds, should_stop_callback)
-                for chunk in stream_iter:
-                    if should_stop_callback is not None and should_stop_callback():
-                        if result_holder is not None:
-                            result_holder.stopped_early = True
-                        break
-                    if chunk:
-                        if first_token_time is None:
-                            first_token_time = time.perf_counter() - start_time
-                            if result_holder is not None:
-                                result_holder.time_to_first_token = round(first_token_time, 2)
-                        accumulated_chunks.append(chunk)
-                        yield chunk
+                else:
+                    target_model = active_model if active_model not in (DEFAULT_GEMINI_MODEL, "gemini-3.5-flash") else DEFAULT_GROQ_MODEL
+                    effective_model = target_model
+                    effective_provider = "groq"
+                    messages = format_conversation_for_openai(
+                        system_instruction=self._system_instruction,
+                        history=history,
+                        current_prompt=clean_prompt,
+                        max_turns=max_context_turns,
+                        evidence_text=evidence_text if web_search_active else None,
+                    )
+                    try:
+                        stream_iter = self._stream_groq(target_model, messages, timeout_seconds, should_stop_callback)
+                        for chunk in stream_iter:
+                            if should_stop_callback is not None and should_stop_callback():
+                                if result_holder is not None:
+                                    result_holder.stopped_early = True
+                                break
+                            if chunk:
+                                if first_token_time is None:
+                                    first_token_time = time.perf_counter() - start_time
+                                    if result_holder is not None:
+                                        result_holder.time_to_first_token = round(first_token_time, 2)
+                                accumulated_chunks.append(chunk)
+                                yield chunk
+                    except (ChatQuotaError, ChatTimeoutError, ChatServiceError) as err:
+                        if has_gemini and not accumulated_chunks and not isinstance(err, ChatAuthError):
+                            logger.warning("Groq stream failed (%s); failing over to Gemini streaming", err)
+                            active_provider = "gemini"
+                            effective_provider = "gemini"
+                        else:
+                            raise
 
-            else:
-                # Gemini with key pool rotation
-                gemini_gen = self._stream_gemini_with_rotation(
-                    history=history,
-                    clean_prompt=clean_prompt,
-                    evidence_text=evidence_text if web_search_active else None,
-                    max_context_turns=max_context_turns,
-                    timeout_seconds=timeout_seconds,
-                    preferred_model=active_model,
-                    should_stop_callback=should_stop_callback,
-                    result_holder=result_holder,
-                )
-                for chunk, m_used in gemini_gen:
-                    effective_model = m_used
-                    if should_stop_callback is not None and should_stop_callback():
-                        if result_holder is not None:
-                            result_holder.stopped_early = True
-                        break
-                    if chunk:
-                        if first_token_time is None:
-                            first_token_time = time.perf_counter() - start_time
+            if active_provider == "gemini":
+                if not has_gemini and has_groq:
+                    logger.info("Gemini key missing; failing over to Groq streaming")
+                    target_model = DEFAULT_GROQ_MODEL
+                    effective_model = target_model
+                    effective_provider = "groq"
+                    messages = format_conversation_for_openai(
+                        system_instruction=self._system_instruction,
+                        history=history,
+                        current_prompt=clean_prompt,
+                        max_turns=max_context_turns,
+                        evidence_text=evidence_text if web_search_active else None,
+                    )
+                    stream_iter = self._stream_groq(target_model, messages, timeout_seconds, should_stop_callback)
+                    for chunk in stream_iter:
+                        if should_stop_callback is not None and should_stop_callback():
                             if result_holder is not None:
-                                result_holder.time_to_first_token = round(first_token_time, 2)
-                        accumulated_chunks.append(chunk)
-                        yield chunk
+                                result_holder.stopped_early = True
+                            break
+                        if chunk:
+                            if first_token_time is None:
+                                first_token_time = time.perf_counter() - start_time
+                                if result_holder is not None:
+                                    result_holder.time_to_first_token = round(first_token_time, 2)
+                            accumulated_chunks.append(chunk)
+                            yield chunk
+                elif not has_gemini:
+                    raise MissingChatKeyError(
+                        "Gemini API key is missing. Add GEMINI_API_KEY to your .env file or get a key at https://aistudio.google.com."
+                    )
+                else:
+                    gemini_model = active_model if active_model in (DEFAULT_GEMINI_MODEL, "gemini-3.5-flash") else DEFAULT_GEMINI_MODEL
+                    effective_model = gemini_model
+                    effective_provider = "gemini"
+                    try:
+                        gemini_gen = self._stream_gemini_with_rotation(
+                            history=history,
+                            clean_prompt=clean_prompt,
+                            evidence_text=evidence_text if web_search_active else None,
+                            max_context_turns=max_context_turns,
+                            timeout_seconds=timeout_seconds,
+                            preferred_model=gemini_model,
+                            should_stop_callback=should_stop_callback,
+                            result_holder=result_holder,
+                        )
+                        for chunk, m_used in gemini_gen:
+                            effective_model = m_used
+                            if should_stop_callback is not None and should_stop_callback():
+                                if result_holder is not None:
+                                    result_holder.stopped_early = True
+                                break
+                            if chunk:
+                                if first_token_time is None:
+                                    first_token_time = time.perf_counter() - start_time
+                                    if result_holder is not None:
+                                        result_holder.time_to_first_token = round(first_token_time, 2)
+                                accumulated_chunks.append(chunk)
+                                yield chunk
+                    except (ChatQuotaError, ChatTimeoutError, ChatServiceError) as err:
+                        if has_groq and not accumulated_chunks and not isinstance(err, ChatAuthError):
+                            logger.warning("Gemini stream failed (%s); failing over to Groq streaming", err)
+                            target_model = DEFAULT_GROQ_MODEL
+                            effective_model = target_model
+                            effective_provider = "groq"
+                            messages = format_conversation_for_openai(
+                                system_instruction=self._system_instruction,
+                                history=history,
+                                current_prompt=clean_prompt,
+                                max_turns=max_context_turns,
+                                evidence_text=evidence_text if web_search_active else None,
+                            )
+                            stream_iter = self._stream_groq(target_model, messages, timeout_seconds, should_stop_callback)
+                            for chunk in stream_iter:
+                                if should_stop_callback is not None and should_stop_callback():
+                                    if result_holder is not None:
+                                        result_holder.stopped_early = True
+                                    break
+                                if chunk:
+                                    if first_token_time is None:
+                                        first_token_time = time.perf_counter() - start_time
+                                        if result_holder is not None:
+                                            result_holder.time_to_first_token = round(first_token_time, 2)
+                                    accumulated_chunks.append(chunk)
+                                    yield chunk
+                        else:
+                            raise
 
         except GeneratorExit:
             if result_holder is not None:
@@ -608,64 +737,13 @@ class ConversationalChatService:
                 result_holder.full_content = final_text
                 result_holder.total_elapsed_seconds = round(elapsed, 2)
                 result_holder.model_used = effective_model
-                result_holder.provider_used = active_provider
+                result_holder.provider_used = effective_provider
                 if first_token_time is not None:
                     result_holder.time_to_first_token = round(first_token_time, 2)
 
     # -------------------------------------------------------------------------
     # Internal Backend Handlers
     # -------------------------------------------------------------------------
-
-    def _call_ollama(self, model: str, messages: list[dict[str, str]], timeout: float) -> str:
-        """Execute non-streaming call to local Ollama."""
-        url = f"{self._ollama_base_url.rstrip('/')}/api/chat"
-        payload = {"model": model, "messages": messages, "stream": False}
-        effective_timeout = max(60.0, timeout)
-        try:
-            resp = requests.post(url, json=payload, timeout=effective_timeout)
-            if resp.status_code != 200:
-                raise ChatServiceError(f"Ollama returned HTTP error {resp.status_code}: {resp.text}")
-            data = resp.json()
-            return data.get("message", {}).get("content", "").strip()
-        except requests.exceptions.ConnectionError as err:
-            raise ChatServiceError(f"Cannot connect to Ollama at {self._ollama_base_url}. Start Ollama with `ollama serve`.") from err
-        except requests.exceptions.Timeout as err:
-            raise ChatTimeoutError(f"Ollama generation timed out after {effective_timeout:.1f}s.") from err
-        except Exception as err:
-            raise ChatServiceError(f"Ollama generation failed: {err}") from err
-
-    def _stream_ollama(
-        self,
-        model: str,
-        messages: list[dict[str, str]],
-        timeout: float,
-        should_stop_callback: Callable[[], bool] | None = None,
-    ) -> Generator[str, None, None]:
-        """Stream chunks from local Ollama via NDJSON response."""
-        url = f"{self._ollama_base_url.rstrip('/')}/api/chat"
-        payload = {"model": model, "messages": messages, "stream": True}
-        effective_timeout = max(60.0, timeout)
-        try:
-            resp = requests.post(url, json=payload, stream=True, timeout=effective_timeout)
-            if resp.status_code != 200:
-                raise ChatServiceError(f"Ollama returned HTTP error {resp.status_code}: {resp.text}")
-            for line in resp.iter_lines(decode_unicode=True):
-                if should_stop_callback is not None and should_stop_callback():
-                    break
-                if line:
-                    try:
-                        data = json.loads(line)
-                        chunk = data.get("message", {}).get("content", "")
-                        if chunk:
-                            yield chunk
-                        if data.get("done", False):
-                            break
-                    except json.JSONDecodeError:
-                        continue
-        except requests.exceptions.ConnectionError as err:
-            raise ChatServiceError(f"Cannot connect to Ollama at {self._ollama_base_url}. Start Ollama with `ollama serve`.") from err
-        except requests.exceptions.Timeout as err:
-            raise ChatTimeoutError(f"Ollama generation timed out after {timeout:.1f}s.") from err
 
     def _call_groq(self, model: str, messages: list[dict[str, str]], timeout: float) -> str:
         """Execute non-streaming call to Groq Cloud API."""
@@ -820,8 +898,8 @@ class ConversationalChatService:
                             pass
                     raise ChatQuotaError(
                         "Gemini API quota or rate limit exceeded. "
-                        "Free tier daily quota reached. Switch to 'Ollama' in the sidebar for unlimited free local chat with zero API keys, "
-                        "or add additional Gemini keys in .env."
+                        "Free tier daily quota reached. Configure GROQ_API_KEY in .env for 14,400 free requests/day "
+                        "or add additional Gemini keys to GEMINI_API_KEY."
                     ) from err
                 raise ChatServiceError(f"Gemini client error: {err}") from err
             except APIError as err:
@@ -830,7 +908,10 @@ class ConversationalChatService:
                     raise ChatTimeoutError(f"Chat response timed out after {timeout_seconds:.1f}s.") from err
                 raise ChatServiceError(f"Gemini API error: {err}") from err
 
-        raise ChatQuotaError("All available Gemini API keys have exhausted their quota. Switch to Ollama or Groq.")
+        raise ChatQuotaError(
+            "All available Gemini API keys have exhausted their quota. "
+            "Configure GROQ_API_KEY in .env for free Groq fallback or add more Gemini keys."
+        )
 
     def _stream_gemini_with_rotation(
         self,
@@ -873,42 +954,47 @@ class ConversationalChatService:
                 config=config,
             )
 
-        stream = None
-        try:
-            stream = _init_stream(model_to_use)
-        except ServerError as err:
-            err_str = str(err).lower()
-            if model_to_use != "gemini-3.5-flash":
-                stream = _init_stream("gemini-3.5-flash")
-                model_to_use = "gemini-3.5-flash"
-            elif "504" in err_str or "deadline" in err_str or "timed out" in err_str:
-                raise ChatTimeoutError(f"Chat response timed out after {timeout_seconds:.1f}s.") from err
-            else:
-                raise ChatServiceError(f"Gemini server error: {err}") from err
-        except ClientError as err:
-            err_str = str(err).lower()
-            if any(k in err_str for k in ("401", "403", "unauthorized", "api_key_invalid")):
-                raise ChatAuthError("Gemini API key is invalid or unauthorized. Verify your key at https://aistudio.google.com.") from err
-            if any(k in err_str for k in ("429", "quota", "resource_exhausted")):
-                if model_to_use != "gemini-3.5-flash":
-                    logger.info("Primary model %s hit quota; falling back to gemini-3.5-flash for streaming", model_to_use)
-                    stream = _init_stream("gemini-3.5-flash")
-                    model_to_use = "gemini-3.5-flash"
-                else:
-                    raise ChatQuotaError("Gemini API quota or rate limit exceeded. Switch to Ollama or Groq.") from err
-            else:
-                raise ChatServiceError(f"Gemini client error: {err}") from err
+        models_to_try = [model_to_use]
+        if model_to_use != "gemini-3.5-flash":
+            models_to_try.append("gemini-3.5-flash")
 
-        try:
-            for chunk in stream:
-                if should_stop_callback is not None and should_stop_callback():
-                    if result_holder is not None:
-                        result_holder.stopped_early = True
-                    break
-                text = chunk.text or ""
-                if text:
-                    yield text, model_to_use
-        except GeneratorExit:
-            if result_holder is not None:
-                result_holder.stopped_early = True
-            raise
+        stream_succeeded = False
+        for m in models_to_try:
+            try:
+                stream = _init_stream(m)
+                for chunk in stream:
+                    if should_stop_callback is not None and should_stop_callback():
+                        if result_holder is not None:
+                            result_holder.stopped_early = True
+                        break
+                    text = chunk.text or ""
+                    if text:
+                        stream_succeeded = True
+                        yield text, m
+                if stream_succeeded:
+                    return
+            except ServerError as err:
+                err_str = str(err).lower()
+                if not stream_succeeded and m != models_to_try[-1]:
+                    logger.warning("Gemini model %s server error (%s); falling back to %s", m, err, models_to_try[-1])
+                    continue
+                if "504" in err_str or "deadline" in err_str or "timed out" in err_str:
+                    raise ChatTimeoutError(f"Chat response timed out after {timeout_seconds:.1f}s.") from err
+                raise ChatServiceError(f"Gemini server error: {err}") from err
+            except ClientError as err:
+                err_str = str(err).lower()
+                if any(k in err_str for k in ("401", "403", "unauthorized", "api_key_invalid")):
+                    raise ChatAuthError("Gemini API key is invalid or unauthorized. Verify your key at https://aistudio.google.com.") from err
+                if any(k in err_str for k in ("429", "quota", "resource_exhausted")):
+                    if not stream_succeeded and m != models_to_try[-1]:
+                        logger.warning("Gemini model %s hit quota; falling back to %s", m, models_to_try[-1])
+                        continue
+                    raise ChatQuotaError(
+                        "Gemini API quota or rate limit exceeded. "
+                        "Configure GROQ_API_KEY in .env for 14,400 free requests/day."
+                    ) from err
+                raise ChatServiceError(f"Gemini client error: {err}") from err
+            except GeneratorExit:
+                if result_holder is not None:
+                    result_holder.stopped_early = True
+                raise
