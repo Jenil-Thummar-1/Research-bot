@@ -3,3 +3,6 @@ tavily-python>=0.5.0
 google-genai>=1.0.0
 python-dotenv>=1.0.0
 pytest>=8.0.0
+ddgs>=9.16.0
+requests>=2.31.0
+

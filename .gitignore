@@ -27,3 +27,13 @@ htmlcov/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local SQLite databases
+data/
+*.db
+*.sqlite3
+
+# Scratch / temporary developer scripts
+scratch/
+
+

@@ -129,3 +129,52 @@ def test_network_timeout_handling(mock_client_cls):
     with pytest.raises(SearchNetworkError) as exc_info:
         service.search("fusion energy")
     assert "Network error" in str(exc_info.value)
+
+
+@patch("ddgs.DDGS")
+def test_duckduckgo_search_success(mock_ddgs_cls):
+    """Verify that duckduckgo_search parses results without any API key."""
+    from src.services.search_service import duckduckgo_search
+
+    mock_inst = MagicMock()
+    mock_ddgs_cls.return_value = mock_inst
+    mock_inst.text.return_value = [
+        {"title": "Open Source AI", "href": "https://example.org/ai", "body": "Free and open models."}
+    ]
+    results = duckduckgo_search("open source ai", max_results=3)
+    assert len(results) == 1
+    assert results[0].title == "Open Source AI"
+    assert results[0].url == "https://example.org/ai"
+    assert results[0].content == "Free and open models."
+
+
+@patch("src.services.search_service.duckduckgo_search")
+def test_tavily_search_falls_back_to_ddg_when_key_missing(mock_ddg):
+    """Verify that search falls back to DuckDuckGo when fallback_to_ddg is enabled and key is missing."""
+    mock_ddg.return_value = [
+        SearchResult(title="DDG Result", url="https://ddg.example.com", content="DDG snippet", score=1.0)
+    ]
+    service = TavilySearchService(api_key="")
+    results = service.search("deep learning", fallback_to_ddg=True)
+    assert len(results) == 1
+    assert results[0].title == "DDG Result"
+    mock_ddg.assert_called_once()
+
+
+@patch("src.services.search_service.TavilyClient")
+@patch("src.services.search_service.duckduckgo_search")
+def test_tavily_search_falls_back_to_ddg_on_rate_limit(mock_ddg, mock_client_cls):
+    """Verify that search falls back to DuckDuckGo when Tavily limit is exceeded and fallback is on."""
+    mock_client = MagicMock()
+    mock_client_cls.return_value = mock_client
+    mock_client.search.side_effect = TavilyLimitError("Quota limit hit")
+    mock_ddg.return_value = [
+        SearchResult(title="DDG Fallback", url="https://ddg.example.com/fallback", content="Snippet", score=1.0)
+    ]
+
+    service = TavilySearchService(api_key="tvly-key")
+    results = service.search("quantum physics", fallback_to_ddg=True)
+    assert len(results) == 1
+    assert results[0].title == "DDG Fallback"
+    mock_ddg.assert_called_once()
+

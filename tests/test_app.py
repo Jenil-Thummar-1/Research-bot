@@ -235,3 +235,56 @@ def test_app_verification_ui_rendered(mock_genai_cls, mock_deep, mock_verify):
     assert any("Evidence Verification Audit" in str(md.value) for md in at.markdown)
     assert any("Reliability Score: 100.0%" in str(md.value) for md in at.markdown)
     assert any("Detailed Claim-by-Claim Evidence Audit" in str(exp.label) for exp in at.expander)
+
+
+@patch("src.services.chat_service.genai.Client")
+def test_app_chat_normal_flow(mock_genai_cls):
+    """Verify that sending a normal chat message generates a response without web search."""
+    mock_client = MagicMock()
+    mock_genai_cls.return_value = mock_client
+    mock_resp = MagicMock()
+    mock_resp.text = "Python decorators are callables that accept a function and return an enhanced function."
+    mock_client.models.generate_content.return_value = mock_resp
+    mock_client.models.generate_content_stream.return_value = [mock_resp]
+
+    at = AppTest.from_file(APP_PATH, default_timeout=15).run()
+    assert not at.exception
+    assert len(at.chat_input) >= 1
+
+    at.chat_input[0].set_value("Explain Python decorators").run()
+    assert not at.exception
+    assert any("Python decorators are callables" in str(md.value) for md in at.markdown)
+
+
+@patch("src.services.chat_service.TavilySearchService.search")
+@patch("src.services.chat_service.genai.Client")
+def test_app_chat_with_web_search_enabled(mock_genai_cls, mock_search):
+    """Verify that toggling web search performs Tavily search and binds citations."""
+    mock_search.return_value = [
+        SearchResult(
+            title="Next Gen Fusion Milestones",
+            url="https://example.com/fusion-news",
+            content="Recent net energy gain demonstrated in magnetic confinement experiment.",
+            score=0.96,
+        )
+    ]
+    mock_client = MagicMock()
+    mock_genai_cls.return_value = mock_client
+    mock_resp = MagicMock()
+    mock_resp.text = "According to [S1], new magnetic confinement experiments demonstrated net energy gain."
+    mock_client.models.generate_content.return_value = mock_resp
+    mock_client.models.generate_content_stream.return_value = [mock_resp]
+
+    at = AppTest.from_file(APP_PATH, default_timeout=15).run()
+    assert not at.exception
+
+    # Enable web search checkbox in sidebar
+    search_checkboxes = [cb for cb in at.checkbox if "Search the Web" in str(cb.label)]
+    if search_checkboxes:
+        search_checkboxes[0].check()
+
+    at.chat_input[0].set_value("What are the latest fusion energy breakthroughs?").run()
+    assert not at.exception
+    assert mock_search.called
+    assert any("fusion-news" in str(md.value) for md in at.markdown)
+

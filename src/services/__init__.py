@@ -42,6 +42,23 @@ from src.services.verification_service import (
     extract_cited_source_ids,
     build_verification_summary,
 )
+from src.services.chat_history_service import (
+    ChatMessage,
+    Conversation,
+    ChatHistoryService,
+)
+from src.services.chat_service import (
+    ConversationalChatService,
+    ChatResponse,
+    StreamResult,
+    ChatServiceError,
+    ChatTimeoutError,
+    MissingChatKeyError,
+    ChatAuthError,
+    ChatQuotaError,
+    format_conversation_for_gemini,
+    should_auto_search,
+)
 
 __all__ = [
     "SearchResult",
@@ -76,4 +93,17 @@ __all__ = [
     "VerificationSummary",
     "extract_cited_source_ids",
     "build_verification_summary",
+    "ChatMessage",
+    "Conversation",
+    "ChatHistoryService",
+    "ConversationalChatService",
+    "ChatResponse",
+    "StreamResult",
+    "ChatServiceError",
+    "ChatTimeoutError",
+    "MissingChatKeyError",
+    "ChatAuthError",
+    "ChatQuotaError",
+    "format_conversation_for_gemini",
+    "should_auto_search",
 ]
